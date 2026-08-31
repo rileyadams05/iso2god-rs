@@ -20,7 +20,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; Node 24
         with:
           lfs: true
 
@@ -66,7 +66,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; Node 24
         with:
           lfs: true
 
@@ -101,26 +101,35 @@ jobs:
         run: python tests/automation_smoke.py "release-output/${{ matrix.binary }}"
 
       - name: Store release asset
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1; Node 24
         with:
           name: ${{ matrix.package_name }}
           path: release-output/${{ matrix.binary }}
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'push'
     name: Publish complete release
     needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Download all release assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1; Node 24
         with:
           path: release-assets
           merge-multiple: true
 
+      - name: Verify complete release asset set
+        shell: bash
+        run: |
+          for asset in win-x64.exe win-x86.exe linux-x64 linux-x86; do
+            test -s "release-assets/$asset"
+          done
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 4
+          sha256sum release-assets/*
+
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3; Node 24
         with:
           files: release-assets/*
           fail_on_unmatched_files: true
