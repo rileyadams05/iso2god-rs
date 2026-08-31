@@ -3,82 +3,120 @@ name: Release
 on:
   push:
     tags:
-      - v*
-    branches:
-      - ci-*
-      - master
+      - "v*"
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish-to-github:
-    name: Build
-    runs-on: ${{matrix.runner}}
+  verify:
+    name: Verify source
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run optimized tests
+        run: cargo test --release --locked --bin iso2god
+
+  build:
+    name: ${{ matrix.package_name }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
-            rust: 1.85.1
-            target: x86_64-unknown-linux-gnu
-            build_filename: iso2god
-            release_filename: iso2god-x86_64-linux
-
-          - runner: ubuntu-24.04-arm
-            rust: 1.85.1
-            target: aarch64-unknown-linux-gnu
-            build_filename: iso2god
-            release_filename: iso2god-aarch64-linux
-
-          - runner: macos-13
-            rust: 1.85.1
-            target: x86_64-apple-darwin
-            build_filename: iso2god
-            release_filename: iso2god-x86_64-macos
-
-          - runner: macos-latest
-            rust: 1.85.1
-            target: aarch64-apple-darwin
-            build_filename: iso2god
-            release_filename: iso2god-aarch64-macos
-
           - runner: windows-latest
-            rust: 1.85.1
-            target: x86_64-pc-windows-gnu
-            build_filename: iso2god.exe
-            release_filename: iso2god-x86_64-windows.exe
+            target: x86_64-pc-windows-msvc
+            binary: win-x64.exe
+            package_name: win-x64
+            linux_packages: ""
+          - runner: windows-latest
+            target: i686-pc-windows-msvc
+            binary: win-x86.exe
+            package_name: win-x86
+            linux_packages: ""
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: linux-x64
+            package_name: linux-x64
+            linux_packages: musl-tools
+          - runner: ubuntu-latest
+            target: i686-unknown-linux-gnu
+            binary: linux-x86
+            package_name: linux-x86
+            linux_packages: gcc-multilib
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Cache
-        uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.rustup
-            target
-          key: ${{ matrix.rust }}-${{ matrix.target }}
+          lfs: true
 
       - name: Install Rust
-        run: |
-          rustup default ${{ matrix.rust }}
-          rustup target add ${{ matrix.target }}
-          rustup show
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-      - name: Build
-        run: |
-          cargo build --release --target ${{ matrix.target }} --bin iso2god
-          mkdir -p ./out
-          mv ./target/${{ matrix.target }}/release/${{ matrix.build_filename }} out/${{ matrix.release_filename }}
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes ${{ matrix.linux_packages }}
 
-      - name: Release
+      - name: Build release executable
+        shell: pwsh
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" --bin iso2god
+          New-Item -ItemType Directory -Path release-output -Force | Out-Null
+          $sourceName = if ($IsWindows) { "iso2god.exe" } else { "iso2god" }
+          $source = Join-Path "target/${{ matrix.target }}/release" $sourceName
+          Copy-Item -LiteralPath $source -Destination "release-output/${{ matrix.binary }}"
+
+      - name: Mark Linux executable
+        if: runner.os == 'Linux'
+        run: chmod 755 "release-output/${{ matrix.binary }}"
+
+      - name: Smoke test executable
+        shell: pwsh
+        run: '& "release-output/${{ matrix.binary }}" --ai-status'
+
+      - name: Smoke test background automation
+        shell: pwsh
+        run: python tests/automation_smoke.py "release-output/${{ matrix.binary }}"
+
+      - name: Store release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package_name }}
+          path: release-output/${{ matrix.binary }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish complete release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
-          draft: ${{ github.ref_type != 'tag' || !startsWith(github.ref_name, 'v') }}
-          files: out/*
-          fail_on_unmatched_files: false
+          files: release-assets/*
+          fail_on_unmatched_files: true
