@@ -1115,7 +1115,7 @@ fn run_terminal_conversion(
     let source = if let Some(source) = dropped_source {
         source
     } else {
-        println!("\nDrag and drop an ISO, ZIP, 7Z, RAR, or multi-part archive");
+        println!("\nDrag and drop an ISO, ZIP, 7Z, RAR, multi-part archive, or archive folder");
         println!("into this terminal. Processing will start automatically.\n");
         let Some(path) = prompt_dropped_game_file()? else {
             return Ok(());
@@ -1123,10 +1123,11 @@ fn run_terminal_conversion(
         path
     };
 
-    let archive_workflow = source
-        .extension()
-        .and_then(OsStr::to_str)
-        .is_none_or(|extension| !extension.eq_ignore_ascii_case("iso"));
+    let archive_workflow = source.is_dir()
+        || source
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("iso"));
 
     loop {
         render_terminal_header()?;
@@ -1351,7 +1352,7 @@ fn run_multipart_game_import() -> Result<(), Error> {
 
         show_import_stage("Scanning dropped folder", 2);
         let sets = if source_input.is_dir() {
-            scan_multipart_game_sets(&source_folder)?
+            scan_archive_sets(&source_folder)?
         } else {
             initial_sets.clone()
         };
@@ -1399,7 +1400,7 @@ fn multipart_game_import_once(
 ) -> Result<(), Error> {
     if sets.is_empty() {
         anyhow::bail!(
-            "no numbered RAR, ZIP, or 7Z archive parts were found in the dropped folder: {}",
+            "no RAR, ZIP, or 7Z archives were found in the dropped folder or its subfolders: {}",
             source_folder.display()
         );
     }
@@ -1416,7 +1417,7 @@ fn multipart_game_import_once(
         anyhow::bail!("Cannot continue: Part 1 is missing from the selected archive set");
     }
     println!(
-        "Detected and verified {} related archive part(s).",
+        "Found {} related archive file(s); no gaps in the discovered volume numbers. Archive integrity is checked during extraction.",
         set.parts.len()
     );
 
@@ -1469,15 +1470,23 @@ fn multipart_game_import_once(
     let prepared = prepare_detected_game(source_folder, &set.game_name, detected)?;
     verify_prepared_game(&prepared)?;
 
-    if remove_parts_after_success {
-        show_import_stage("Removing completed archive parts", 70);
-        remove_verified_archive_parts(source_folder, &set.parts)?;
-    } else {
-        show_import_stage("Preserving original archive", 70);
-    }
+    show_import_stage("Preserving source archives until delivery succeeds", 70);
     match destination {
         MultipartDestination::Usb(drive) => copy_prepared_game_to_selected_drive(&prepared, drive)?,
         MultipartDestination::Ftp => upload_prepared_game_to_xbox(&prepared)?,
+    }
+
+    if remove_parts_after_success && set.parts.len() > 1 {
+        // Recursive discovery may select a set in a subfolder. Only that set's
+        // own directory is eligible for cleanup, after successful delivery.
+        let part_folder = set
+            .entry_path
+            .parent()
+            .context("archive has no parent folder")?;
+        if !fs::canonicalize(part_folder)?.starts_with(fs::canonicalize(source_folder)?) {
+            anyhow::bail!("refusing archive cleanup outside the dropped folder");
+        }
+        remove_verified_archive_parts(part_folder, &set.parts)?;
     }
 
     if staging.is_dir() && staging != prepared.root {
@@ -1510,167 +1519,211 @@ fn detect_xbox_game_with_nested_archives(
     extracted_root: &Path,
     seven_zip: &Path,
 ) -> Result<DetectedXboxGame, Error> {
-    let mut current_root = extracted_root.to_path_buf();
-    for nested_level in 0..4 {
-        match detect_extracted_xbox_game(&current_root) {
-            Ok(game) => return Ok(game),
-            Err(format_error) => {
-                let Some(nested) = find_nested_archive_set(&current_root)? else {
-                    return Err(format_error);
-                };
-                if let Some(missing) = &nested.missing_part {
-                    anyhow::bail!("Cannot continue: nested archive part `{missing}` is missing");
-                }
-
-                println!("Nested archive detected: {}", nested.entry_path.display());
-                let destination = unique_path(
-                    &current_root,
-                    &format!(".iso2god-nested-extraction-{}", nested_level + 1),
-                );
-                fs::create_dir(&destination).with_context(|| {
-                    format!(
-                        "could not create nested extraction folder {}",
-                        destination.display()
-                    )
-                })?;
-                show_import_stage("Extracting nested archive", 46);
-                let progress = ProgressDisplay::new();
-                progress.update("Extracting nested archive", 0);
-                let status =
-                    extract_with_7zip(seven_zip, &nested.entry_path, &destination, &progress)?;
-                if !status.success() {
-                    anyhow::bail!(
-                        "7-Zip could not extract the nested archive set (exit status {status})"
-                    );
-                }
-                progress.finish("Nested extraction complete");
-                verify_nonempty_directory(&destination)?;
-                current_root = destination;
-                show_import_stage("Detecting Xbox 360 format", 48);
-            }
+    // Queue every branch, not just the first archive encountered. Each newly
+    // extracted directory is scanned once; source archives are never requeued.
+    let mut pending = std::collections::VecDeque::from(scan_archive_sets(extracted_root)?);
+    let mut extracted_count = 0_u64;
+    while let Some(nested) = pending.pop_front() {
+        if let Some(missing) = &nested.missing_part {
+            anyhow::bail!(
+                "Cannot continue: nested archive part `{missing}` is missing beside {}",
+                nested.entry_path.display()
+            );
         }
+        println!("Nested archive detected: {}", nested.entry_path.display());
+        let unpacked_size = list_archive_unpacked_size(seven_zip, &nested.entry_path)?;
+        let required = unpacked_size.saturating_add(512 * 1024 * 1024);
+        let available = fs2::available_space(extracted_root)?;
+        if available < required {
+            anyhow::bail!(
+                "not enough free storage for nested archive {} ({} required, {} available)",
+                nested.entry_path.display(),
+                format_byte_size(required),
+                format_byte_size(available)
+            );
+        }
+        extracted_count += 1;
+        // Keep destinations shallow even when the archive chain is very deep.
+        let destination = unique_path(
+            extracted_root,
+            &format!(".iso2god-nested-extraction-{extracted_count}"),
+        );
+        fs::create_dir(&destination).with_context(|| {
+            format!(
+                "could not create nested extraction folder {}",
+                destination.display()
+            )
+        })?;
+        show_import_stage("Extracting nested archive", 46);
+        let progress = ProgressDisplay::new();
+        progress.update("Extracting nested archive", 0);
+        let status = extract_with_7zip(seven_zip, &nested.entry_path, &destination, &progress)?;
+        if !status.success() {
+            anyhow::bail!(
+                "7-Zip could not extract nested archive {} (exit status {status}); originals preserved",
+                nested.entry_path.display()
+            );
+        }
+        progress.finish("Nested extraction complete");
+        pending.extend(scan_archive_sets(&destination)?);
     }
-    anyhow::bail!("too many nested archive layers were found")
+    show_import_stage("Detecting Xbox 360 format", 48);
+    detect_extracted_xbox_game(extracted_root)
 }
 
-fn find_nested_archive_set(root: &Path) -> Result<Option<MultipartGameSet>, Error> {
+fn scan_archive_sets(root: &Path) -> Result<Vec<MultipartGameSet>, Error> {
     let mut directories = vec![root.to_path_buf()];
+    let mut sets = Vec::new();
     while let Some(directory) = directories.pop() {
-        let sets = scan_multipart_game_sets(&directory)?;
-        if sets.len() > 1 {
-            anyhow::bail!(
-                "multiple nested archive sets were found in {}; keep one game per archive",
-                directory.display()
-            );
-        }
-        if let Some(set) = sets.into_iter().next() {
-            return Ok(Some(set));
-        }
-
-        let mut single_archives = Vec::new();
+        sets.extend(scan_archive_sets_in_directory(&directory)?);
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                directories.push(path);
-                continue;
+            // Do not follow symlinks/junctions into cycles or outside this tree.
+            if entry.file_type()?.is_dir() && !entry.path().is_symlink() {
+                directories.push(entry.path());
             }
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let extension = path
-                .extension()
-                .and_then(OsStr::to_str)
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if matches!(extension.as_str(), "zip" | "7z" | "rar")
-                && parse_multipart_part_name(&name, path.clone()).is_none()
-            {
-                single_archives.push(path);
-            }
-        }
-        if single_archives.len() > 1 {
-            anyhow::bail!(
-                "multiple nested archives were found in {}; keep one game per archive",
-                directory.display()
-            );
-        }
-        if let Some(archive) = single_archives.pop() {
-            let archive_set = detect_archive_set(&archive)?;
-            let game_name = archive
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .map(sanitize_game_name)
-                .context("the nested archive name is not valid Unicode")?;
-            return Ok(Some(MultipartGameSet {
-                game_name,
-                entry_path: archive_set.entry_path,
-                parts: vec![archive],
-                missing_part: None,
-            }));
         }
     }
-    Ok(None)
+    sets.sort_by(|a, b| a.entry_path.cmp(&b.entry_path));
+    Ok(sets)
+}
+
+fn scan_archive_sets_in_directory(directory: &Path) -> Result<Vec<MultipartGameSet>, Error> {
+    let mut sets = scan_multipart_game_sets(directory)?;
+    let mut seen = sets
+        .iter()
+        .flat_map(|set| set.parts.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut files = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    for file in &files {
+        if seen.contains(file) {
+            continue;
+        }
+        let extension = file
+            .extension()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let legacy_volume = extension.len() == 3
+            && matches!(extension.as_bytes()[0], b'r' | b'z')
+            && extension.as_bytes()[1..].iter().all(u8::is_ascii_digit);
+        if !matches!(extension.as_str(), "zip" | "7z" | "rar") && !legacy_volume {
+            continue;
+        }
+        let archive = detect_archive_set(file)
+            .with_context(|| format!("could not identify archive {}", file.display()))?;
+        if seen.contains(&archive.entry_path) {
+            continue;
+        }
+        let mut parts = vec![archive.entry_path.clone()];
+        if archive.multipart {
+            let base = archive
+                .entry_path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .context("archive name is not valid Unicode")?
+                .to_ascii_lowercase();
+            let marker = if archive
+                .entry_path
+                .extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rar"))
+            {
+                "r"
+            } else {
+                "z"
+            };
+            let prefix = format!("{base}.{marker}");
+            parts.extend(
+                files
+                    .iter()
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(OsStr::to_str)
+                            .is_some_and(|name| {
+                                let name = name.to_ascii_lowercase();
+                                name.strip_prefix(&prefix).is_some_and(|digits| {
+                                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                                })
+                            })
+                    })
+                    .cloned(),
+            );
+        }
+        seen.extend(parts.clone());
+        sets.push(MultipartGameSet {
+            game_name: sanitize_game_name(
+                archive
+                    .entry_path
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .context("archive name is not valid Unicode")?,
+            ),
+            entry_path: archive.entry_path,
+            parts,
+            missing_part: None,
+        });
+    }
+    Ok(sets)
 }
 
 fn multipart_sets_for_dropped_input(
     source: &Path,
 ) -> Result<(PathBuf, Vec<MultipartGameSet>, bool), Error> {
     if source.is_dir() {
-        return Ok((
-            source.to_path_buf(),
-            scan_multipart_game_sets(source)?,
-            true,
-        ));
+        return Ok((source.to_path_buf(), scan_archive_sets(source)?, true));
     }
-
     let parent = source
         .parent()
         .context("the dropped archive does not have a parent folder")?
         .to_path_buf();
-    let is_numbered_part = source
+    let canonical_source = fs::canonicalize(source)?;
+    // Inspect only this file's set; an unrelated damaged set must not prevent
+    // importing an explicitly dropped archive.
+    if source
         .file_name()
         .and_then(OsStr::to_str)
-        .is_some_and(|name| parse_multipart_part_name(name, source.to_path_buf()).is_some());
-    if is_numbered_part {
+        .is_some_and(|name| parse_multipart_part_name(name, source.to_path_buf()).is_some())
+    {
         let mut sets = scan_multipart_game_sets(&parent)?;
-        let canonical_source = fs::canonicalize(source)?;
         sets.retain(|set| {
-            set.parts.iter().any(|part| {
-                fs::canonicalize(part).is_ok_and(|canonical| canonical == canonical_source)
-            })
+            set.parts
+                .iter()
+                .any(|part| fs::canonicalize(part).is_ok_and(|path| path == canonical_source))
         });
         if sets.is_empty() {
-            anyhow::bail!("the complete numbered archive set could not be identified");
+            anyhow::bail!("the numbered archive set could not be identified");
         }
         return Ok((parent, sets, true));
     }
-
     let archive = detect_archive_set(source)?;
-    if !archive.multipart {
-        let game_name = source
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .map(sanitize_game_name)
-            .context("the dropped archive name is not valid Unicode")?;
-        return Ok((
-            parent,
-            vec![MultipartGameSet {
-                game_name,
-                entry_path: archive.entry_path,
-                parts: vec![source.to_path_buf()],
-                missing_part: None,
-            }],
-            false,
-        ));
+    if archive.multipart {
+        let mut sets = scan_archive_sets_in_directory(&parent)?;
+        sets.retain(|set| set.entry_path == archive.entry_path);
+        return Ok((parent, sets, true));
     }
-
-    anyhow::bail!(
-        "this multipart naming style requires dropping the folder containing every related part"
-    )
+    let game_name = source
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .map(sanitize_game_name)
+        .context("the dropped archive name is not valid Unicode")?;
+    Ok((
+        parent,
+        vec![MultipartGameSet {
+            game_name,
+            entry_path: archive.entry_path,
+            parts: vec![source.to_path_buf()],
+            missing_part: None,
+        }],
+        false,
+    ))
 }
 
 fn show_import_stage(stage: &str, percent: u8) {
@@ -1796,17 +1849,18 @@ fn choose_multipart_game_set(sets: Vec<MultipartGameSet>) -> Result<MultipartGam
     if sets.len() == 1 {
         return Ok(sets.into_iter().next().unwrap());
     }
-    println!("\nMultiple multipart games were detected:\n");
+    println!("\nMultiple game archives were detected:\n");
     let options = sets
         .iter()
         .enumerate()
         .map(|(index, set)| MenuOption {
             value: index,
             label: format!(
-                "{}. {} ({} parts)",
+                "{}. {} ({} files) - {}",
                 index + 1,
                 set.game_name,
-                set.parts.len()
+                set.parts.len(),
+                set.entry_path.display()
             ),
         })
         .collect::<Vec<_>>();
@@ -1863,14 +1917,18 @@ fn require_7zip_for_multipart() -> Result<PathBuf, Error> {
 
 fn list_archive_unpacked_size(seven_zip: &Path, part_one: &Path) -> Result<u64, Error> {
     let output = Command::new(seven_zip)
-        .args(["l", "-slt", "-ba"])
+        // -ba hides archive-level errors (including corrupt ZIP headers).
+        .args(["l", "-slt", "-sccUTF-8", "--"])
         .arg(part_one)
+        .stdin(Stdio::null())
         .output()
         .context("could not inspect the multipart archive with 7-Zip")?;
     if !output.status.success() {
         anyhow::bail!(
-            "7-Zip could not validate the complete archive set before extraction: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "7-Zip could not inspect {} ({}). This does not by itself mean a numbered part is missing. The archive may be damaged, incomplete, encrypted, or unreadable. Originals were preserved.\n{}",
+            part_one.display(),
+            output.status,
+            archive_diagnostics(&output.stdout, &output.stderr)
         );
     }
     let size = String::from_utf8_lossy(&output.stdout)
@@ -1882,6 +1940,20 @@ fn list_archive_unpacked_size(seven_zip: &Path, part_one: &Path) -> Result<u64, 
         anyhow::bail!("7-Zip reported that the multipart archive contains no extractable data");
     }
     Ok(size)
+}
+
+fn archive_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    );
+    let text = text.trim();
+    if text.is_empty() {
+        "7-Zip returned no diagnostic text.".to_owned()
+    } else {
+        text.chars().take(12_000).collect()
+    }
 }
 
 fn verify_nonempty_directory(root: &Path) -> Result<(), Error> {
@@ -2365,7 +2437,7 @@ fn prompt_terminal_text(
 }
 
 fn prompt_dropped_game_file() -> Result<Option<PathBuf>, Error> {
-    prompt_dropped_path("Waiting for game file", Some(false))
+    prompt_dropped_path("Waiting for game file or archive folder", None)
 }
 
 fn prompt_dropped_archive_input() -> Result<Option<PathBuf>, Error> {
@@ -2851,7 +2923,7 @@ fn prepare_source(source: &Path) -> Result<PreparedSource, Error> {
     })?;
     if archive.multipart {
         println!(
-            "Detected and verified {} related archive parts.",
+            "Found {} related archive parts; integrity is checked during extraction.",
             archive.part_count
         );
     }
@@ -3093,8 +3165,11 @@ fn extract_with_7zip(
         .arg("-bso0")
         .arg("-bsp1")
         .arg("-bse1")
+        .arg("-sccUTF-8")
         .arg(format!("-o{}", destination.display()))
+        .arg("--")
         .arg(source)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()
         .context("error starting 7-Zip")?;
@@ -3119,7 +3194,15 @@ fn extract_with_7zip(
         }
     }
 
-    child.wait().context("error waiting for 7-Zip")
+    let status = child.wait().context("error waiting for 7-Zip")?;
+    if !status.success() {
+        anyhow::bail!(
+            "7-Zip extraction failed for {} ({status}); originals preserved.\n{}",
+            source.display(),
+            archive_diagnostics(&recent, &[])
+        );
+    }
+    Ok(status)
 }
 
 fn last_percentage(output: &[u8]) -> Option<u8> {
@@ -5025,11 +5108,77 @@ mod tests {
         )
         .unwrap();
 
-        let set = find_nested_archive_set(&root).unwrap().unwrap();
+        let sets = scan_archive_sets(&root).unwrap();
+        assert_eq!(sets.len(), 1);
+        let set = &sets[0];
         assert_eq!(set.parts.len(), 2);
         assert!(set.entry_path.ends_with("gta.san.god.todoinmega.part1.rar"));
         assert!(set.missing_part.is_none());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scans_all_folder_branches_without_mixing_same_named_sets() {
+        let mut temp = TempDir::new().unwrap();
+        temp.cleanup = true;
+        let root = temp.path();
+        let deep = root.join("one/two/three/four/five/six");
+        let other = root.join("other");
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        for name in ["game.part1.rar", "game.part2.rar", "single.zip"] {
+            fs::write(deep.join(name), b"placeholder").unwrap();
+        }
+        for name in ["game.part1.rar", "game.part3.rar", "single.7z"] {
+            fs::write(other.join(name), b"placeholder").unwrap();
+        }
+        let (_, sets, _) = multipart_sets_for_dropped_input(root).unwrap();
+        assert_eq!(sets.len(), 4);
+        let complete = sets
+            .iter()
+            .find(|set| set.entry_path == deep.join("game.part1.rar"))
+            .unwrap();
+        assert_eq!(complete.parts.len(), 2);
+        assert!(complete.missing_part.is_none());
+        let incomplete = sets
+            .iter()
+            .find(|set| set.entry_path == other.join("game.part1.rar"))
+            .unwrap();
+        assert_eq!(incomplete.missing_part.as_deref(), Some("game.part2.rar"));
+    }
+
+    #[test]
+    fn groups_legacy_volumes_once_and_includes_all_parts() {
+        let mut temp = TempDir::new().unwrap();
+        temp.cleanup = true;
+        let root = temp.path();
+        for name in [
+            "game.rar",
+            "game.r00",
+            "game.r01",
+            "other.zip",
+            "other.z01",
+            "other.z02",
+        ] {
+            fs::write(root.join(name), b"placeholder").unwrap();
+        }
+        let sets = scan_archive_sets(root).unwrap();
+        assert_eq!(sets.len(), 2);
+        assert!(sets.iter().all(|set| set.parts.len() == 3));
+        let (_, dropped, _) = multipart_sets_for_dropped_input(&root.join("game.r01")).unwrap();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].entry_path, root.join("game.rar"));
+    }
+
+    #[test]
+    fn archive_errors_include_both_output_streams_or_a_fallback() {
+        let text = archive_diagnostics(b"Headers Error", b"Data Error");
+        assert!(text.contains("Headers Error"));
+        assert!(text.contains("Data Error"));
+        assert_eq!(
+            archive_diagnostics(b"", b""),
+            "7-Zip returned no diagnostic text."
+        );
     }
 
     #[test]
