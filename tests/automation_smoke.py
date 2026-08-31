@@ -12,7 +12,7 @@ import time
 import zipfile
 
 binary = str(Path(sys.argv[1]).resolve())
-root = Path(tempfile.mkdtemp(prefix="iso2god-bridge-smoke-"))
+root = Path(tempfile.mkdtemp(prefix="iso2god-bridge-smoke-")).resolve()
 environment = dict(os.environ, APPDATA=str(root / "config"),
                    XDG_CONFIG_HOME=str(root / "config"), ISO2GOD_DISABLE_UPDATE_CHECK="1")
 process = subprocess.Popen([binary, "--mcp-server"], stdin=subprocess.PIPE,
