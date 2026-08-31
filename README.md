@@ -36,6 +36,12 @@ The walkthrough follows the app's order: **first-run FTP choice → connection d
 main menu → game preparation and delivery**. The annotated images are illustrative recreations;
 placeholder paths and progress values are examples, not live screenshots or test results.
 
+Expand the sections below to see their instructions and images. Select the same row again to
+collapse it; downloads, credits and licence information remain visible.
+
+<details>
+<summary><strong>Show first-launch instructions and FTP setup</strong></summary>
+
 Have the following ready:
 
 - Your game backup: an ISO, a supported archive, or every volume of a multipart archive.
@@ -138,7 +144,12 @@ and reopen the converter. Installation may require operating-system permission. 
 Linux saved-password support requires an unlocked Secret Service keyring and `secret-tool`,
 commonly supplied by `libsecret-tools`.
 
+</details>
+
 ## Understand the main menu
+
+<details>
+<summary><strong>Show menu options and screenshot</strong></summary>
 
 ![Annotated main menu explaining USB delivery, FTP delivery, Multipart Game Import, and keyboard navigation.](docs/images/main-menu-v2.png)
 
@@ -158,7 +169,12 @@ after dropping a valid game path** at a file-drop prompt.
 
 AI control is separate from this menu. There is no Optional submenu and no AI screen to leave open.
 
+</details>
+
 ## 1. Save a game to USB
+
+<details>
+<summary><strong>Show USB instructions and screenshots</strong></summary>
 
 **Result:** the complete prepared game is written to the USB drive you select. The Xbox does not
 need to be connected to your computer over the network.
@@ -220,7 +236,12 @@ existing game directory. **Direct ISO-to-USB conversion can replace matching fil
 directory. Back up an existing installation before reinstalling; do not erase the entire Content
 folder. These behaviours differ in the current implementation.
 
+</details>
+
 ## 2. Transfer through FTP
+
+<details>
+<summary><strong>Show FTP transfer instructions and screenshot</strong></summary>
 
 **Result:** the prepared game is uploaded to the Xbox's internal drive over your local network.
 The bundled **rclone** transfer engine runs in the background; no separate FTP client window is needed.
@@ -317,7 +338,12 @@ settings. Renaming, replacing or downloading the executable again does not reset
 existing setup. On a new user's account, setup starts without a saved Xbox address or password.
 USB-only users can decline FTP setup and configure it later when they first choose FTP.
 
+</details>
+
 ## 3. Import multipart archives
+
+<details>
+<summary><strong>Show multipart instructions, screenshot and source-file handling</strong></summary>
 
 **Result:** one complete game is prepared from its archive set, delivered through USB or FTP, and
 a prepared local copy is retained beside the source. Use this option when you prefer to drop a
@@ -420,7 +446,12 @@ Deletion is not a move to the Recycle Bin. Do not assume an error during a later
 numbered parts still exist. Background AI jobs have a different default: they preserve source
 archives unless explicitly instructed otherwise.
 
+</details>
+
 ## Read progress and confirm completion
+
+<details>
+<summary><strong>Show progress stages and verification details</strong></summary>
 
 There are two different kinds of progress display. Orange headings such as
 **[18%] Extracting complete game** are workflow checkpoints. The changing progress bar underneath
@@ -446,7 +477,12 @@ check expected destination files and sizes; direct ISO-to-USB has the limitation
 None of these checks is a byte-for-byte checksum comparison or an Xbox gameplay test. Successful transfer
 does not guarantee that a damaged source or incompatible game will launch.
 
+</details>
+
 ## Find the game on your Xbox
+
+<details>
+<summary><strong>Show Xbox library and scan-path instructions</strong></summary>
 
 After the converter reports success, your dashboard may still need to scan the destination.
 Copying a game and adding it to the dashboard's library are separate steps.
@@ -494,7 +530,12 @@ If the game is missing, confirm the files exist on that device before repeatedly
 cover appears but launching is unavailable, check whether its underlying game files are present.
 A cached cover is not evidence that an installation is complete.
 
+</details>
+
 ## Background AI and developer control
+
+<details>
+<summary><strong>Show AI setup, batch operations and developer reference</strong></summary>
 
 AI integration is built into the executable and runs separately from the terminal interface.
 There is no Optional menu and no AI screen to leave open. A compatible AI client or developer tool
@@ -657,7 +698,12 @@ Application control does not grant an AI arbitrary shell access or a source-code
 AI can modify and rebuild the project through its own authorized development tools; the bridge
 exposes the implemented converter operations rather than an unrestricted command-execution endpoint.
 
+</details>
+
 ## 4. Update now
+
+<details>
+<summary><strong>Show update instructions</strong></summary>
 
 Release builds use the existing `self_update` library to check their configured GitHub repository
 for a newer release at startup. You do not need to install a separate updater.
@@ -680,7 +726,12 @@ Builds without a configured release repository do not check automatically. Downl
 newer executable from Releases manually after closing the app. Keep game files separate from the
 application download.
 
+</details>
+
 ## Troubleshooting
+
+<details>
+<summary><strong>Show common problems and solutions</strong></summary>
 
 - **No USB drive detected:** connect and mount it, then choose **Refresh drive list**. The menu
   lists detected removable/USB storage, not every internal disk.
@@ -708,6 +759,8 @@ application download.
 - **Source archives disappeared:** recognised numbered volumes are removed after preparation in
   manual workflows. Look for the retained prepared game and read the source-file handling table
   before attempting a retry. An ordinary single source archive is preserved.
+
+</details>
 
 ## Credits
 
