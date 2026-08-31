@@ -8,7 +8,7 @@ This is an optimized rewrite of [iso2god-cli](https://github.com/eliecharra/iso2
 extra features.
 
 <details>
-<summary><strong>Show downloads and complete guide</strong></summary>
+<summary><strong>Show guide</strong></summary>
 
 ## Downloads
 
