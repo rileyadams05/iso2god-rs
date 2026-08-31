@@ -148,7 +148,7 @@ jobs:
           jq -e '
             [.[].jobs[]] | group_by(.name) | map(max_by(.id)) as $jobs |
             ["Verify source", "win-x64", "win-x86", "linux-x64", "linux-x86"] |
-            all(. as $name; any($jobs[]; .name == $name and .conclusion == "success"))
+            all(. as $name | any($jobs[]; .name == $name and .conclusion == "success"))
           ' source-jobs.json
           echo "Reusing successful builds from run $SOURCE_RUN_ID; no source checks or builds rerun." >> "$GITHUB_STEP_SUMMARY"
 
